@@ -1,0 +1,347 @@
+#!/usr/bin/ruby
+#
+# Copyright (c) 2013- Stripe, Inc. (https://stripe.com)
+#
+# Cronwrapper is published under the MIT license
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in
+# all copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
+
+require 'optparse'
+require 'tempfile'
+
+require 'rubygems'
+require 'subprocess'
+
+class CronWrapper
+  attr_reader :options, :cmd
+
+  # The SERVER_HEALTH_COMMAND is expected to return exit status 0 when the
+  # server is healthy and 10 when the server is unhealthy or deliberately
+  # brought out of normal rotation.
+  SERVER_HEALTH_COMMAND = '/usr/local/bin/server-health'
+
+  def parse_args(args)
+    @options = {
+      :health => false,
+      :health_fail => nil,
+    }
+
+    parser = OptionParser.new do |opts|
+      opts.banner = "Usage: #{$0} [options] COMMAND"
+
+      opts.on('--lockdir DIR', 'Use lock directory DIR') do |dir|
+        options[:lockdir] = dir
+      end
+
+      opts.on('--lockfailok', 'Exit peacefully if we are unable to grab the lockdir') do
+        options[:lockfailok] = true
+      end
+
+      opts.on('--pin-deploy DIR', 'Mark DIR not to be purged by henson on deploy while job is running') do |dir|
+        options[:pin_deploy] = dir
+      end
+
+      opts.on('--logfile LOG', 'Log output to a file.') do |log|
+        options[:logfile] = log
+      end
+
+      opts.on('--max-lines NUM', 'Limit number of lines sent to stdout; ' +
+          "doesn't affect log file") do |num|
+        options[:max_lines] = Integer(num)
+        if options[:max_lines] < 0
+          puts opts
+          exit 1
+        end
+      end
+
+      opts.on('--max-bytes NUM', 'Limit number of bytes sent to stdout; ' +
+          "doesn't affect log file") do |num|
+        options[:max_bytes] = Integer(num)
+        if options[:max_bytes] < 0
+          puts opts
+          exit 1
+        end
+      end
+
+      opts.on('--health-fail', 'Fail if server is server-health down') do
+        options[:health] = true
+        options[:health_fail] = true
+      end
+
+      opts.on('--health-down', 'Silently skip run if server-health down') do
+        options[:health] = true
+        options[:health_fail] = false
+      end
+
+      opts.on('-h', '--help', 'Display this help message') do
+        puts opts
+        exit(0)
+      end
+    end
+
+    parser.order!(args)
+    @cmd = args
+
+    if @cmd.empty?
+      puts parser
+      exit 1
+    end
+  end
+
+  def initialize(args)
+    parse_args(args)
+  end
+
+  def health_up?
+    r = Subprocess.call([SERVER_HEALTH_COMMAND, 'status'])
+    case r.exitstatus
+    when 0
+      return true
+    when 10
+      return false
+    else
+      raise "Unexpected server-health status: #{r.exitstatus}"
+    end
+  end
+
+  def grab_lock
+    return unless options[:lockdir]
+
+    begin
+      Dir.mkdir(options[:lockdir])
+      @did_lock = true
+    rescue Errno::EEXIST
+      if options[:lockfailok]
+        exit(0)
+      else
+        $stderr.puts("ERROR: Failed to acquire lock!")
+        begin
+          pid = File.read(File.join(options[:lockdir], 'pid')).strip
+          $stderr.puts("Process #{pid} holds the lock.")
+          Subprocess.check_call(["ps", "-fp", pid.to_s])
+        rescue Errno::ENOENT, Errno::EACCES, Errno::EPERM
+        end
+        exit(250)
+      end
+    end
+
+    File.open(File.join(options[:lockdir], 'pid'), 'w') { |f| f.write("#{$$}\n") }
+  end
+
+  def setup_output
+    if STDOUT.tty?
+      STDOUT.puts("Running on a TTY, not buffering output.")
+      @destfile = STDOUT
+    else
+      tmpfile = Tempfile.new("cronwrapper")
+      # On ruby 1.9, Tempfile#dup doesn't actually dup(2), so
+      # @tmpfile.dup.close closes the original FD. Re-open the file to
+      # get a vanilla File object, since we rely on the dup(2) below.
+      @destfile = File.open(tmpfile.path, 'w+')
+      tmpfile.unlink
+      tmpfile.close
+    end
+  end
+
+  def do_output
+    @destfile.rewind
+
+    limits = []
+
+    if options[:max_lines]
+      limits << "#{options[:max_lines]} lines"
+    end
+
+    if options[:max_bytes]
+      # only print notice if we actually hit the limit
+      size = @destfile.stat.size
+      if size > options[:max_bytes] + @extra_bytes.to_i
+        puts "Something went wrong: tmpfile is #{size} bytes!"
+      end
+      if size >= options[:max_bytes]
+        limits << "#{options[:max_bytes]} bytes"
+      end
+    end
+
+    if limits.empty?
+      limit_text = ''
+    else
+      limit_text = ' (last ' + limits.join(' or ') + ')'
+    end
+
+    if !@destfile.tty?
+      # If it is a tty, we'll have already streamed the output to it.
+      puts "Output:" + limit_text
+      @destfile.each do |line|
+        puts line
+      end
+    end
+  end
+
+  def exit_with_signal(sig)
+    puts "Cronwrapper: '#{cmd.join(' ')}' exiting on signal #{sig}."
+    do_output
+    exit(251)
+  end
+
+  def setup_handlers
+    %w[HUP INT QUIT TERM].each do |sig|
+      Signal.trap(sig) do
+        exit_with_signal(sig)
+      end
+    end
+  end
+
+  def reset_env
+    ENV.delete_if {|k, v| k =~ /^RBENV_/}
+  end
+
+  def run_child
+    if options[:pin_deploy]
+      pinpath = File.expand_path(File.join(options[:pin_deploy], ".henson.deploy_pin"))
+      # Take a shared lock on a file that tells henson not to prune this directory.
+      henson_pinfile = File.open(pinpath, "a+")
+      henson_pinfile.flock(File::LOCK_SH)
+    end
+
+    # why are we dup-ing this?
+    dest = @destfile.dup
+
+    # So we can still write a message about the exit status after tail exists.
+    dest_after_tail = dest
+
+    @tailproc = nil
+    if options[:max_lines] || options[:max_bytes]
+      tail_cmd = ['tail']
+      if options[:max_lines]
+        tail_cmd += ['--lines', options.fetch(:max_lines).to_s]
+      end
+      if options[:max_bytes]
+        tail_cmd += ['--bytes', options.fetch(:max_bytes).to_s]
+      end
+      @tailproc = Subprocess.popen(tail_cmd,
+                                   :stdout => dest,
+                                   :stderr => Subprocess::STDOUT,
+                                   :stdin  => Subprocess::PIPE)
+      dest = @tailproc.stdin
+    end
+
+    @logproc = nil
+    if options[:logfile]
+      @logproc = Subprocess.popen(['/usr/local/bin/unilog', '-v', options[:logfile]],
+                                  :stdout => dest,
+                                  :stderr => Subprocess::STDOUT,
+                                  :stdin  => Subprocess::PIPE)
+      @logproc.stdin.puts("Starting run of #{cmd.join(' ')}")
+      dest = @logproc.stdin
+    end
+
+    exec_error, status = nil, nil
+    begin
+      child = Subprocess.popen(cmd,
+                               :stdout => dest,
+                               :stderr => Subprocess::STDOUT)
+      status = child.wait
+    rescue SystemCallError => e
+      exec_error = e
+    end
+
+    if exec_error
+      msg = "#{cmd.join(' ')} failed to execute: #{exec_error}"
+      dest_after_tail.puts(msg)
+      @extra_bytes = msg.size + 1
+    elsif !status.exited? || status.exitstatus != 0
+      msg = "#{cmd.join(' ')} exited with status #{status.inspect}"
+      dest_after_tail.puts(msg)
+      # Later on we'll sanity check that the temp file's been limited to
+      # max_bytes but it'll be a little long because this message doesn't go
+      # through tail. Keep track of how much bigger it's allowed to be.
+      @extra_bytes = msg.size + 1 # for newline
+    end
+
+    ensure_done(@logproc)
+    ensure_done(@tailproc)
+
+    if options[:pin_deploy]
+      henson_pinfile.close
+    end
+
+    status
+  end
+
+  def ensure_done(maybe_proc)
+    if maybe_proc
+      maybe_proc.stdin.close unless maybe_proc.stdin.closed?
+      maybe_proc.wait
+      maybe_proc = nil
+    end
+  end
+
+  def cleanup
+    if @did_lock
+      FileUtils.rm_rf(options[:lockdir])
+    end
+    cleanup_proc(@logproc)
+    cleanup_proc(@tailproc)
+  end
+
+  def cleanup_proc(maybe_proc)
+    if maybe_proc && maybe_proc.poll.nil?
+      maybe_proc.send_signal('TERM')
+      maybe_proc.wait
+    end
+  end
+
+  def run
+    begin
+      if options.fetch(:health) && !health_up?
+        if options.fetch(:health_fail)
+          puts 'Not running because we are server-health down'
+          exit 1
+        else
+          exit
+        end
+      end
+
+      grab_lock
+      setup_output
+      setup_handlers
+      reset_env
+      @start_time = Time.new().utc()
+      status = run_child
+      if status && status.exited? && status.exitstatus == 0
+        exit(0)
+      end
+      do_output
+      if status.nil?
+        exit(255)
+      elsif status.exited?
+        exit(status.exitstatus)
+      else
+        exit(251)
+      end
+    ensure
+      cleanup
+    end
+  end
+end
+
+if $0 == __FILE__
+  CronWrapper.new(ARGV).run
+end
